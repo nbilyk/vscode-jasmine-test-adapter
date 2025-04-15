@@ -1,7 +1,6 @@
 import { ChildProcess, fork } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs-extra';
-import { fileURLToPath } from 'url';
 import { IMinimatch, Minimatch } from 'minimatch';
 import * as path from 'path';
 import * as stackTrace from 'stack-trace';
@@ -26,6 +25,11 @@ interface IDisposable {
 	dispose(): void;
 }
 
+type ChunkData = {
+	type: 'start' | 'data' | 'end'
+	data?: string
+}
+
 export class JasmineAdapter implements TestAdapter, IDisposable {
 
 	private disposables: IDisposable[] = [];
@@ -38,6 +42,7 @@ export class JasmineAdapter implements TestAdapter, IDisposable {
 	private nodesById = new Map<string, TestSuiteInfo | TestInfo>();
 
 	private runningTestProcess: ChildProcess | undefined;
+	private loadingTestsProcess: ChildProcess | undefined;
 
 	private stderr?: Buffer;
 
@@ -131,18 +136,16 @@ export class JasmineAdapter implements TestAdapter, IDisposable {
 
 		if (this.log.enabled) this.log.info(`Loading test files of ${this.workspaceFolder.uri.fsPath} using ${this.getConfigLog()}`);
 
-		const rootSuite: TestSuiteInfo = {
+		let rootSuite: TestSuiteInfo = {
 			type: 'suite',
 			id: 'root',
 			label: 'Jasmine',
 			children: []
 		}
 
-		const suites: { [id: string]: TestSuiteInfo } = {};
-
 		let errorMessage;
 
-		await new Promise<JasmineTestSuiteInfo | undefined>(resolve => {
+		await new Promise<TestSuiteInfo | undefined>(resolve => {
 			const args = [
 				config.jasminePath,
 				config.configFilePath,
@@ -150,7 +153,7 @@ export class JasmineAdapter implements TestAdapter, IDisposable {
 				JSON.stringify(this.log.enabled)
 			];
 			this.stderr = Buffer.alloc(0);
-			const childProcess = fork(
+			this.loadingTestsProcess = fork(
 				require.resolve('./worker/loadTests.js'),
 				args,
 				{
@@ -161,71 +164,43 @@ export class JasmineAdapter implements TestAdapter, IDisposable {
 					stdio: ['pipe', 'pipe', 'pipe', 'ipc']
 				}
 			);
+			this.pipeProcess(this.loadingTestsProcess);
+			
+			let data = ''
 
-			this.pipeProcess(childProcess);
-
-			// The loader emits one suite per file, in order of running
-			// When running in random order, the same file may have multiple suites emitted
-			// This way the only thing we need to do is just to replace the name
-			// With a shorter one
-			childProcess.on('message', (message: string | JasmineTestSuiteInfo) => {
+			this.loadingTestsProcess.on('message', (message: string | ChunkData) => {
 
 				if (typeof message === 'string') {
 
 					this.log.info(`Worker: ${message}`);
 
 				} else {
-
-					if (this.log.enabled) this.log.info(`Received tests for ${message.file} from worker`);
-					let file = message.file!;
-					try {
-						file = fileURLToPath(file);
-					} catch {}
-					if (this.log.enabled) this.log.info(`spec dir ${config.specDir} file ${file}`);
-					let baseDir = config.specRealDir;
-					if (file.startsWith(config.specDir) && !file.startsWith(config.specRealDir)) {
-						baseDir = config.specDir;
-					} 
-					message.label = file.replace(baseDir, '').replace(/^\//, '');
-					if (suites[file]) {
-						suites[file].children = suites[file].children.concat(message.children);
-					} else {
-						suites[file] = message;
+					switch (message.type) {
+						case 'start':
+							data = ''
+							break
+						case 'data' :
+							data += message.data!
+							break
+						case 'end':
+							rootSuite = JSON.parse(data)
+							data = ''
+							break
 					}
 				}
 			});
 
-			childProcess.on('exit', (code, signal) => {
+			this.loadingTestsProcess.on('exit', (code, signal) => {
 				if (code || signal) {
 					errorMessage = `The Jasmine test loader worker process finished with code ${code} and signal ${signal}.\n${this.stderr?.toString()}`;
 				}
 				this.log.info('Worker finished');
-				resolve(undefined);
+				this.loadingTestsProcess = undefined
+				resolve(void 0);
 			});
 		});
 
-		function sort(suite: (TestInfo | TestSuiteInfo)) {
-			const s = suite as TestSuiteInfo;
-			if (s.children) {
-				s.children = s.children.sort((a, b) => {
-					return a.line! - b.line!;
-				});
-				s.children.forEach((suite) => sort(suite));
-			}
-			return s;
-		}
-
-		// Sort the suites by their filenames
-		Object.keys(suites).sort((a, b) => {
-			return a.toLocaleLowerCase() < b.toLocaleLowerCase() ? -1 : 1;
-		}).forEach((file) => {
-			try {
-				file = fileURLToPath(file);
-			} catch {}
-			rootSuite.children.push(sort(suites[file]));
-		});
-
-		this.nodesById.clear();
+		this.nodesById.clear()
 		this.collectNodesById(rootSuite);
 
 		if (errorMessage) {
@@ -580,8 +555,4 @@ interface LoadedConfig {
 	debuggerConfig: string | undefined;
 	breakOnFirstLine: boolean;
 	debuggerSkipFiles: string[];
-}
-
-interface JasmineTestSuiteInfo extends TestSuiteInfo {
-	isFileSuite?: boolean;
 }
